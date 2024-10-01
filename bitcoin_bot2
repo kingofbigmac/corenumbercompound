@@ -1,0 +1,171 @@
+import robin_stocks.robinhood as r
+import time
+import os
+import logging
+import threading
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Constants for Bitcoin, Ethereum, and AMZY stock
+CORE_AMOUNTS = {
+    'BTC': 30.00,  # Core amount to maintain in USD for Bitcoin
+    'ETH': 31.00,  # Core amount to maintain in USD for Ethereum
+    'AMZY': 0.00  # Core amount to maintain in USD for AMZY stock
+}
+PROFIT_TARGET = 0.60  # 10 cent profit target
+DIP_TARGET = 1.50  # 20 cent dip target
+REQUEST_DELAY = 10  # Delay between API requests to avoid rate limits
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Log in to Robinhood using environment variables
+username = os.getenv('ROBINHOOD_USERNAME')
+password = os.getenv('ROBINHOOD_PASSWORD')
+r.login(username, password)
+
+def get_crypto_value(symbol):
+    """Get the current value of a cryptocurrency (BTC or ETH) holdings in USD."""
+    try:
+        crypto_positions = r.crypto.get_crypto_positions()
+        crypto_holdings = 0.0
+        for position in crypto_positions:
+            if position['currency']['code'] == symbol:
+                crypto_holdings = float(position['quantity_available'])
+                break
+        current_price = float(r.crypto.get_crypto_quote(symbol)['mark_price'])
+        total_value = crypto_holdings * current_price
+
+        logging.info(f"Current {symbol} Holdings: {crypto_holdings:.8f} {symbol}, Current Price: ${current_price:.2f}, Total Value: ${total_value:.2f}")
+        return total_value, crypto_holdings
+    except Exception as e:
+        logging.error(f"Error retrieving {symbol} value: {e}")
+        return 0.0, 0.0
+
+def get_stock_value(symbol):
+    """Get the current value of a stock (AMZY) holdings in USD."""
+    try:
+        stock_holdings = float(r.account.build_holdings()[symbol]['quantity'])
+        current_price = float(r.stocks.get_latest_price(symbol)[0])
+        total_value = stock_holdings * current_price
+
+        logging.info(f"Current {symbol} Holdings: {stock_holdings:.2f} shares, Current Price: ${current_price:.2f}, Total Value: ${total_value:.2f}")
+        return total_value, stock_holdings
+    except Exception as e:
+        logging.error(f"Error retrieving {symbol} value: {e}")
+        return 0.0, 0.0
+
+def check_for_profit(symbol, asset_type, total_profit):
+    """Check if the profit target is reached and sell excess."""
+    try:
+        if asset_type == 'crypto':
+            current_value, holdings = get_crypto_value(symbol)
+        else:
+            current_value, holdings = get_stock_value(symbol)
+            
+        logging.info(f"Checking for profit: {symbol} - Current Value: ${current_value:.2f}, Total Profit: ${total_profit:.2f}")
+
+        if current_value >= CORE_AMOUNTS[symbol] + PROFIT_TARGET:
+            amount_to_sell = current_value - CORE_AMOUNTS[symbol]
+            if asset_type == 'crypto':
+                response = r.orders.order_sell_crypto_by_price(symbol, amountInDollars=amount_to_sell)
+            else:
+                response = r.orders.order_sell_fractional_by_price(symbol, amountInDollars=amount_to_sell)
+
+            logging.info(f"Sold excess {symbol} worth ${amount_to_sell:.2f}. Response: {response}")
+            total_profit += amount_to_sell - CORE_AMOUNTS[symbol]
+            return total_profit
+        else:
+            return total_profit
+    except Exception as e:
+        logging.error(f"Error checking for profit on {symbol}: {e}")
+        return total_profit
+
+def check_for_dip(symbol, asset_type, total_profit):
+    """Check if the value dips and reinvest."""
+    try:
+        if asset_type == 'crypto':
+            current_value, holdings = get_crypto_value(symbol)
+            logging.info(f"Checking for dip: {symbol} - Current Value: ${current_value:.2f}, Total {symbol} Holdings: {holdings:.8f} {symbol}")
+        else:
+            current_value, holdings = get_stock_value(symbol)
+            logging.info(f"Checking for dip: {symbol} - Current Value: ${current_value:.2f}, Total {symbol} Holdings: {holdings:.2f} shares")
+
+        # Only buy if the current value is less than or equal to the core amount minus the dip target
+        if current_value <= CORE_AMOUNTS[symbol] - DIP_TARGET:
+            amount_to_invest = min(total_profit, CORE_AMOUNTS[symbol] - current_value) if total_profit > 0 else 0.35
+
+            if amount_to_invest > 0:
+                if asset_type == 'crypto':
+                    response = r.orders.order_buy_crypto_by_price(symbol, amountInDollars=amount_to_invest)
+                else:
+                    response = r.orders.order_buy_fractional_by_price(symbol, amountInDollars=amount_to_invest)
+                logging.info(f"Bought {symbol} worth ${amount_to_invest:.2f}. Response: {response}")
+                total_profit -= amount_to_invest
+            else:
+                logging.info(f"Not enough profit to reinvest in {symbol}.")
+        
+        return total_profit
+    except Exception as e:
+        logging.error(f"Error checking for dip on {symbol}: {e}")
+        return total_profit
+
+def trading_bot(symbol, asset_type):
+    total_profit = 0.0
+    logging.info(f"Starting trading bot for {symbol} with a core value of ${CORE_AMOUNTS[symbol]:.2f}")
+
+    while True:
+        total_profit = check_for_profit(symbol, asset_type, total_profit)
+        total_profit = check_for_dip(symbol, asset_type, total_profit)
+        time.sleep(REQUEST_DELAY)
+
+def display_crypto_price(symbol):
+    while True:
+        try:
+            current_price = float(r.crypto.get_crypto_quote(symbol)['mark_price'])
+            logging.info(f"Current {symbol} price: ${current_price:.2f}")
+            time.sleep(REQUEST_DELAY)
+        except Exception as e:
+            logging.error(f"Error fetching {symbol} price: {e}")
+
+def display_stock_price(symbol):
+    while True:
+        try:
+            current_price = float(r.stocks.get_latest_price(symbol)[0])
+            logging.info(f"Current {symbol} stock price: ${current_price:.2f}")
+            time.sleep(REQUEST_DELAY)
+        except Exception as e:
+            logging.error(f"Error fetching {symbol} stock price: {e}")
+
+def main():
+    # Threads for Bitcoin, Ethereum, and AMZY
+    btc_price_thread = threading.Thread(target=display_crypto_price, args=('BTC',))
+    eth_price_thread = threading.Thread(target=display_crypto_price, args=('ETH',))
+    amzy_price_thread = threading.Thread(target=display_stock_price, args=('AMZY',))
+
+    btc_trading_thread = threading.Thread(target=trading_bot, args=('BTC', 'crypto'))
+    eth_trading_thread = threading.Thread(target=trading_bot, args=('ETH', 'crypto'))
+    amzy_trading_thread = threading.Thread(target=trading_bot, args=('AMZY', 'stock'))
+
+    # Start threads
+    btc_price_thread.start()
+    eth_price_thread.start()
+    amzy_price_thread.start()
+
+    btc_trading_thread.start()
+    eth_trading_thread.start()
+    amzy_trading_thread.start()
+
+    # Join threads
+    btc_price_thread.join()
+    eth_price_thread.join()
+    amzy_price_thread.join()
+
+    btc_trading_thread.join()
+    eth_trading_thread.join()
+    amzy_trading_thread.join()
+
+if __name__ == "__main__":
+    main()
